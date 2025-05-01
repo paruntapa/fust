@@ -1,37 +1,65 @@
-use std::collections::HashMap;
-
-use axum::extract::ws::Message;
-use tokio::sync::{broadcast, mutext};
+use std::{collections::HashMap, time::Duration};
+use std::sync::Arc;
+use axum::extract::{State, WebSocketUpgrade};
+use axum::{Router, routing::get, response::IntoResponse};
+use axum::extract::ws::{Message, WebSocket};
+use futures::{StreamExt, SinkExt};
+use serde_json::Value;
+use uuid::Uuid;
+use tokio::{sync::{broadcast, mpsc, Mutex}, time::interval};
 
 #[derive(Clone)]
-
 struct AppState {
-    connections: Arc<Mute><HashMap<String, broadcast::Sender<Message>>>>,
+    connections: Arc<Mutex<HashMap<String, broadcast::Sender<Message>>>>,
+}
+
+#[tokio::main]
+async fn main() {
+    let state = AppState {
+        connections: Arc::new(Mutex::new(HashMap::new()))
+    };
+
+    let app = Router::new()
+        .route("/ws", get(websocket_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
+    println!("Server is running on 8000");
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState){
-    let conn_id: String = Uuid::new_v4().to_string();
-    let conn_id_clone: String = conn_id.clone();
-    let (tx: Sender<{unknown}>, mut rx: Receiver<{unknown}>) = broadcast::channel(capacit_100);
+    let conn_id = Uuid::new_v4().to_string();
+    let conn_id_clone = conn_id.clone();
+    println!("New connection: {}", conn_id);
+
+    let (tx, mut rx) = broadcast::channel(100);
     {
-        let mut connections: MutexGuard<'_, HashMap<String, broadcast::Sender<Message>>> = state.connections.lock().await;
-        connections.insert(k: conn_id.clone(), v: tx.clone());
+        let mut connections = state.connections.lock().await;
+        connections.insert(conn_id_clone.clone(), tx.clone());
     }
 
-    let (mut sender: SplitSink<WebSocket, Message>, mut receiver: SplitStream<WebSocket>) = socket.split();
-    let (message_tx: sender<Message>, mut message_rx: Receiver<Message>) = mpsc::channel::<Message>(buffer: 100);
+    let (mut sender, mut receiver) = socket.split();
+    let (message_tx, mut message_rx) = mpsc::channel::<Message>(100);
 
-    let sender_task: JoinHandle<()> = tokio::spawn(async move {
+    let sender_task = tokio::spawn(async move {
         while let Some(msg) = message_rx.recv().await {
-            if sender.send(item:msg).await.is_err() {
+            if sender.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
-    let ping_tx: Sender<Message> = message_tx.clone();
-    let ping_task: JoinHandle<()> = tokio::spawn(future:async move {
-        let mut interval: Interval = interval(period:Duration::from_secs(30));
+    let ping_tx = message_tx.clone();
+    let ping_task = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             if ping_tx.send(Message::Ping(vec![])).await.is_err() {
@@ -40,29 +68,62 @@ async fn handle_socket(socket: WebSocket, state: AppState){
         }
     });
     
-    let forward_tx: Sender<Message> = message_tx.clone();
-    let forward_task: JoinHandle<()> = tokio::spawn(future:async move {
-        while let Ok(msg: Message) = rx.recv().await {
+    let forward_tx = message_tx.clone();
+    let forward_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
             if forward_tx.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
-    let receive_task: JoinHandle<<() as future>::Output> = tokio::spawn(future:{
-        let state: AppState = state.clone();
-        let tx: Sender<Message> = tx.clone();
-        let mut target_map: HashMap<String, String> = HashMap::new();
+    let state_clone = state.clone();
+    let tx_clone = tx.clone();
+    let conn_id_for_task = conn_id.clone();
+    let receive_task = tokio::spawn(async move {
+        let mut target_map = HashMap::new();
 
-        async move {
-            while let Some(Ok(msg: Message)) = receiver.next().await {
-                match msg {
-                    Message::Text(text: String) => {
-                        
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if let Ok(data) = serde_json::from_str::<Value>(&text) {
+                        if data["type"] == "register" {
+                            if let Some(id) = data["connection_id"].as_str() {
+                                state_clone.connections.lock().await.insert(id.to_string(), tx_clone.clone());
+                            }
+                            continue;
+                        }
+                        if let Some(target_id) = data["target_id"].as_str() {
+                            target_map.insert(conn_id_for_task.clone(), target_id.to_string());
+                            if let Some(target_tx) = state_clone.connections.lock().await.get(target_id) {
+                                let _ = target_tx.send(Message::Text(text));
+                            }
+                        }
                     }
                 }
+                Message::Binary(bin_data) => {
+                    if let Some(target_id) = target_map.get(&conn_id_for_task){
+                        if let Some(target_tx) = state_clone.connections.lock().await.get(target_id) {
+                            let _ = target_tx.send(Message::Binary(bin_data));
+                        }
+                    } else {
+                        println!("No target set for binary transfer from {}", conn_id_for_task);
+                    }
+                }
+                Message::Close(_) => break,
+                _ => continue,
             }
         }
+    });
+
+    let state_for_cleanup = state.clone();
+    tokio::select! {
+        _ = sender_task => {},
+        _ = ping_task => {},
+        _ = forward_task => {},
+        _ = receive_task => {},
     }
-    
+
+    state_for_cleanup.connections.lock().await.remove(&conn_id_clone);
+    println!("Connection closed: {}", conn_id_clone);
 }
